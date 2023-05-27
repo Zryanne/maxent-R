@@ -1,0 +1,205 @@
+library(dplyr)
+library(sf)
+library(units)
+library(spThin)
+library(rnaturalearth)
+library(smoothr)
+library(raster) 
+library(dismo)
+library(rgdal)
+library(tidyr)
+library(ggplot2)
+library(rJava)
+library(devtools)
+install_github("danlwarren/ENMTools")
+library(ENMTools)
+install.extras()
+library(ENMeval)
+
+## create raster stack
+
+setwd("C:/Users/zryan/Desktop/Ready Rasters")
+
+rasterFileNames <- list.files(pattern=".tif")
+
+rasterSet <- sapply(rasterFileNames, raster) %>% stack()
+
+headers <- rasterFileNames %>% sub(".tif", "", .)
+
+names(rasterSet) <- headers
+
+
+## get IL shapefile to check extent/boundary is correct
+
+setwd("C:/Users/zryan/Desktop/ZoeWesTutorial/Shapefiles")
+
+map <- read_sf("ne_10m_admin_1_states_provinces.shp")
+
+illinois <- map %>% dplyr::filter(name == "Illinois")
+
+extent <- extent(st_bbox(illinois))
+
+plot(rasterSet$canopyCover) #change to see all rasters
+plot(extent, add = TRUE)
+plot(illinois$geometry, add = TRUE, alpha = 0)
+
+
+## read in specimen data
+
+setwd("C:/Users/zryan/Desktop/Occurence Data Sets")
+
+pointsRaw <- read.csv("SpeciesOneListFORMODEL.csv", fileEncoding = "latin1")
+
+points <- pointsRaw[,c(1,15,74,75)]
+
+pointsSF <- st_as_sf(points,coords = c(4,3), 
+                     crs= crs(map))
+
+
+## filter points outside IL boundary
+
+plot(illinois$geometry)
+plot(pointsSF$geometry, add = TRUE)
+
+pointsFiltered <- st_filter(pointsSF, illinois)
+
+plot(illinois$geometry)
+plot(pointsFiltered$geometry, add = TRUE)
+
+## compare original points in CSV format to filtered points in sf format
+
+pointsFilteredDF <- left_join(points, pointsFiltered, by = "id") %>% drop_na() %>%
+  dplyr::select(c(2:4,6)) %>% rename(scientificName = scientificName.x)
+
+write.csv(pointsFilteredDF, "SpeciesFilteredDF.csv")
+
+
+## trim occurrence records
+
+trimDist <- 5   #distance is in km
+
+thinnedOCC <- matrix(nrow=0, ncol=3)
+
+colnames(thinnedOCC) <- c("scientificName", "decimalLongitude", "decimalLatitude")
+
+spp<-unique(points$scientificName)
+
+for (i in 1:length(spp)) {
+  spp[i] -> sp01
+  points %>% filter(scientificName == sp01) -> points01
+  thin(loc.data = points01, lat.col = "decimalLatitude", long.col = "decimalLongitude", spec.col = "scientificName",
+       thin.par = trimDist, reps=10, write.files = T, out.dir=getwd(),
+       out.base=sp01, max.files=1)
+  list.files(pattern="thin1.csv") -> thinnedFile
+  read.csv(thinnedFile, stringsAsFactors = F) -> thinnedPoints01
+  unlink(thinnedFile)
+  rbind(thinnedOCC, thinnedPoints01) -> thinnedOCC
+}
+
+setwd("C:/Users/zryan/Desktop/THESIS OUTPUT/SPECIES MODELS")
+
+write.csv(thinnedOCC, "SpeciespointsFilteredThinned.csv")
+
+
+## get background points for Maxent modeling
+
+pseudoPointCount<-10000
+backgroundPoints <- matrix(nrow=0, ncol=3)
+
+spp<-unique(thinnedOCC$scientificName)
+
+for (i in 1:length(spp)) {
+  spp[i] -> sp01
+  st_sample(illinois, size = pseudoPointCount, 
+            type = "random") %>% st_union()-> step
+  step[[1]] %>% unclass() %>% as.data.frame() -> step02
+  cbind(sp01,step02)->step03
+  backgroundPoints <- rbind(backgroundPoints, step03)
+}
+
+colnames(backgroundPoints) <- c("scientificName", "decimalLongitude", "decimalLatitude")
+
+
+## split occurrences into training and testing subsets for Maxent
+
+trainSet <- thinnedOCC %>% group_by(scientificName) %>% sample_frac(0.75) %>% ungroup()
+testSet <- anti_join(thinnedOCC,trainSet)
+
+## Run replicates to determine if AUC is high enough
+setwd("C:/Users/zryan/Desktop/THESIS OUTPUT/SPECIES MODELS")
+outputReplicate <- vector()
+
+for (i in 1:length(spp)) {
+  spp[i] -> sp01
+  trainSet %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> presence01
+  backgroundPoints %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> absence01
+  dir.create(paste0(sp01))
+  maxent(x = rasterSet, p = presence01, a = absence01, silent = T, path = sp01, args = c('replicates=10') ) -> re
+  outputReplicate <- c(outputReplicate, re)
+}
+
+## train Maxent model with full data
+outputMaxent <- vector()
+
+for (i in 1:length(spp)) {
+  spp[i] -> sp01
+  trainSet %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> presence01
+  backgroundPoints %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> absence01
+  dir.create(paste0(sp01))
+  maxent(x = rasterSet, p = presence01, a = absence01, silent = T, path = sp01, args = c('jackknife=TRUE') ) -> me
+  outputMaxent <- c(outputMaxent, me)
+}
+
+## evaluate Maxent model & check AUC scores
+outputEvaluate <- vector()
+AUC <- vector()
+
+for (i in 1:length(spp)) {
+  spp[i] -> sp01
+  testSet %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> presence02
+  backgroundPoints %>% filter(scientificName == sp01) %>% 
+    dplyr::select(-scientificName) %>% as.data.frame() -> absence02
+  evaluate(x = rasterSet, p = presence02, a = absence02, model = outputMaxent[[i]]) -> e
+  AUC <- c(AUC,e@auc)
+  outputEvaluate <- c(outputEvaluate, e)
+}
+
+AUC <- AUC %>% as.data.frame() %>% cbind(spp,.) %>% 
+  dplyr::rename(scientificName = 1, AUCs = 2) %>% 
+  mutate_at(vars(-scientificName), as.numeric)
+
+plotAUC <-ggplot(AUC, aes(x=scientificName, y=AUCs, fill=as.factor(scientificName) )) + 
+  geom_bar(stat = "identity")+
+  geom_text(aes(label = scientificName, group = scientificName), size = 3, 
+            color = "white", angle = 90, hjust = 1.5)+
+  scale_fill_viridis(discrete = T, begin = 0, end = 0.9) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        legend.position = "NONE", panel.background = element_blank(), 
+        axis.text.x = element_blank(),
+        axis.title.x=element_blank(), axis.line = element_line(colour = "black"))
+
+AUC
+write.csv(AUC, "SpeciesAUC.csv")
+plotAUC
+
+## predict using Maxent models
+outputPrediction <- vector()
+
+for (i in 1:length(spp)){
+  spp[i] -> sp01
+  prediction <- predict(object = outputMaxent[[i]], x = rasterSet, 
+                        ext = extent, progress = "text")
+  prediction <- mask(prediction, illinois)
+  outputPrediction <- c(outputPrediction, prediction)
+}
+
+for (i in 1:length(spp)) {
+  plot(outputPrediction[[i]])
+}
+
+plot(outputPrediction)
